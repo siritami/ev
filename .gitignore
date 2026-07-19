@@ -1,0 +1,32 @@
+# Build directories
+build/
+build32/
+build64/
+cmake-build-*/
+out/
+
+# IDE files
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln.docstates
+
+# Compiled binaries
+*.exe
+*.dll
+*.obj
+*.pdb
+*.ilk
+*.lib
+*.exp
+
+# CMake generated
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# Misc
+*.log
+*.tmp
