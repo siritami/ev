@@ -1,17 +1,27 @@
 /**
- * evk_input.c - Vietnamese Input Engine
+ * evk_input.c - Vietnamese Input Engine (Rewritten)
  *
- * Core logic for processing keystrokes and composing Vietnamese characters.
- * Supports Telex and VNI input methods.
+ * Core logic for composing Vietnamese characters from keystrokes.
  *
- * The engine works by maintaining a "compose state" that tracks:
- *   1. The base vowel/letter typed so far
- *   2. Any compound vowel being built (e.g. "oa" → "ơa")
- *   3. The tone mark applied
- *   4. Whether the composition is active
+ * HOW IT WORKS:
+ *   Base characters (vowels, consonants) pass through normally so
+ *   the user can see them in the editor. When a tone key (f/s/r/x/j
+ *   in Telex) or special vowel key (dd, ow, etc.) is pressed, the
+ *   engine erases the visible characters and replaces them with the
+ *   composed Vietnamese character(s).
  *
- * When a complete Vietnamese character is formed, it sends the output
- * via simulated keystrokes (SendInput) or clipboard paste.
+ *   Example: typing "a" in Telex:
+ *     1. Press 'a' -> 'a' appears in editor
+ *     2. Press 's' (sac) -> 'a' is erased, 'a' with acute sent
+ *
+ *   Example: typing "a" with breve in Telex:
+ *     1. Press 'a' -> 'a' appears
+ *     2. Press 'a' again -> 'a' erased, breve-a sent
+ *
+ *   Example: typing compound vowel with tone in Telex:
+ *     1. Press 'o' -> 'o' appears (start composition)
+ *     2. Press 'w' -> 'o' erased, o-hook sent (visible: o-hook)
+ *     3. Press 's' -> o-hook erased, o-hook with acute sent
  */
 
 #include "evk.h"
@@ -23,419 +33,48 @@
 
 void input_init(EvkComposeState *state)
 {
-    memset(state, 0, sizeof(*state));
     state->active = FALSE;
-    state->base_char = 0;
-    state->tone_char = 0;
-    state->compose_len = 0;
+    state->base = 0;
+    state->extra = 0;
+    state->visible_count = 0;
     state->last_key_time = 0;
 }
 
 void input_reset(EvkComposeState *state)
 {
-    if (state->compose_len > 0) {
-        /* Flush any pending composition by sending raw characters */
-        for (int i = 0; i < state->compose_len; i++) {
-            if (state->buffer[i]) {
-                input_send_char(state->buffer[i]);
-            }
-        }
-    }
     input_init(state);
 }
 
 /* ========================================================================
- * Telex Input Method
+ * Send Characters to the Target Application
  *
- * Telex rules:
- *   - Double vowels: aa→ă, ee→ê, oo→ô, ow→ơ, uw→ư
- *   - Double consonant: dd→đ
- *   - Tone marks: f=huyền, s=sắc, r=hỏi, x=ngã, j=nặng
- *   - z after vowel removes tone
- *   - w after d → đ (dd)
- *   - w after vowels → compound vowel indicator (e.g. ow→ơ)
- *
+ * Uses SendInput with KEYEVENTF_UNICODE for reliable character delivery
+ * to any application (including UWP, browsers, terminals, etc.)
  * ======================================================================== */
 
-BOOL telex_process(EvkComposeState *state, wchar_t key)
+static void send_unicode_char(wchar_t ch)
 {
-    wchar_t lower_key = (wchar_t)CharLowerW((LPWSTR)(ULONG_PTR)key);
-
-    /* ---- Tone mark keys (only valid after a vowel) ---- */
-    if (state->base_char && wcschr(telex_tone_keys, lower_key)) {
-        VnTone new_tone = TONE_NONE;
-
-        for (int i = 0; telex_tones[i].key; i++) {
-            if (telex_tones[i].key == lower_key) {
-                new_tone = telex_tones[i].tone;
-                break;
-            }
-        }
-
-        if (new_tone != TONE_NONE) {
-            /* z = remove tone */
-            if (lower_key == L'z') {
-                state->tone_char = 0;
-            } else {
-                /* If same tone pressed twice, cycle: e.g. aa→a (remove) */
-                if (state->tone_char == vn_apply_tone(state->base_char, new_tone)) {
-                    state->tone_char = 0;
-                } else {
-                    state->tone_char = vn_apply_tone(state->base_char, new_tone);
-                }
-            }
-            return TRUE; /* Compose state updated, don't send key */
-        }
-    }
-
-    /* ---- Double-letter vowels: aa, ee, oo ---- */
-    if (state->compose_len > 0 && state->base_char == lower_key) {
-        /* Check for special compound: dd→đ */
-        if (lower_key == L'd' && state->compose_len == 1) {
-            /* dd → đ */
-            state->buffer[0] = L'\x0111';
-            state->base_char = L'\x0111';
-            state->compose_len = 1;
-            return TRUE;
-        }
-
-        /* Check vowel doubling: aa→ă, ee→ê, oo→ô */
-        for (int i = 0; telex_vowels[i].input; i++) {
-            if (telex_vowels[i].input[0] == lower_key &&
-                telex_vowels[i].input[1] == lower_key) {
-                state->buffer[0] = telex_vowels[i].output;
-                state->base_char = telex_vowels[i].output;
-                state->compose_len = 1;
-                return TRUE;
-            }
-        }
-    }
-
-    /* ---- w after vowel → compound vowel (ơ, ư) ---- */
-    if (state->base_char && lower_key == L'w') {
-        /* ow → ơ, uw → ư */
-        if (state->base_char == L'o' && state->compose_len == 1) {
-            state->buffer[0] = L'\x01A1'; /* ơ */
-            state->base_char = L'\x01A1';
-            return TRUE;
-        }
-        if (state->base_char == L'u' && state->compose_len == 1) {
-            state->buffer[0] = L'\x01B0'; /* ư */
-            state->base_char = L'\x01B0';
-            return TRUE;
-        }
-        /* aw → ă (alternative to aa) */
-        if (state->base_char == L'a' && state->compose_len == 1) {
-            state->buffer[0] = L'\x0103'; /* ă */
-            state->base_char = L'\x0103';
-            return TRUE;
-        }
-        /* After other vowels: w starts a compound */
-        if (state->compose_len == 1) {
-            state->vowel_extra = L'w';
-            state->compose_len = 2;
-            state->buffer[1] = L'w';
-            return TRUE;
-        }
-    }
-
-    /* ---- d→đ in single keystroke (when not composing 'd') ---- */
-    if (lower_key == L'd' && !state->active) {
-        /* Start composing 'd' - might become 'đ' if followed by 'd' */
-        state->active = TRUE;
-        state->base_char = L'd';
-        state->buffer[0] = L'd';
-        state->compose_len = 1;
-        return TRUE;
-    }
-
-    /* ---- Check if key starts a Vietnamese letter ---- */
-    if (!state->active) {
-        for (int i = 0; vn_start_chars[i]; i++) {
-            if (vn_start_chars[i] == lower_key) {
-                /* Start composition */
-                state->active = TRUE;
-                state->base_char = lower_key;
-                state->buffer[0] = lower_key;
-                state->compose_len = 1;
-                return TRUE;
-            }
-        }
-        return FALSE; /* Not a Vietnamese letter, let it pass through */
-    }
-
-    /* ---- Compound vowel: second letter after initial vowel ---- */
-    if (state->active && state->compose_len == 1 && state->base_char) {
-        /* Check if this key forms a compound vowel with the base */
-        for (int i = 0; compound_vowels[i].input; i++) {
-            if (compound_vowels[i].base == state->base_char &&
-                compound_vowels[i].input[1] == lower_key) {
-                state->vowel_extra = lower_key;
-                state->compose_len = 2;
-                state->buffer[1] = lower_key;
-                return TRUE;
-            }
-        }
-    }
-
-    /* ---- Letter not part of current composition: flush and restart ---- */
-    if (state->active) {
-        /* Flush current composition */
-        input_reset(state);
-        /* Start new composition if this is a valid start */
-        for (int i = 0; vn_start_chars[i]; i++) {
-            if (vn_start_chars[i] == lower_key) {
-                state->active = TRUE;
-                state->base_char = lower_key;
-                state->buffer[0] = lower_key;
-                state->compose_len = 1;
-                return TRUE;
-            }
-        }
-        return FALSE;
-    }
-
-    return FALSE;
-}
-
-/* ========================================================================
- * VNI Input Method
- *
- * VNI uses digit keys 0-9 after vowels:
- *   1=huyền, 2=sắc, 3=hỏi, 4=ngã, 5=nặng, 0=remove
- *   6=ă, 7=â, 8=ê, 9=ô
- *
- * ======================================================================== */
-
-BOOL vni_process(EvkComposeState *state, wchar_t key)
-{
-    /* VNI digit tone keys */
-    for (int i = 0; vni_tones[i].key; i++) {
-        if (vni_tones[i].key == key && state->base_char) {
-            VnTone new_tone = vni_tones[i].tone;
-
-            if (new_tone == TONE_NONE) {
-                state->tone_char = 0;
-            } else {
-                state->tone_char = vn_apply_tone(state->base_char, new_tone);
-            }
-            return TRUE;
-        }
-    }
-
-    /* VNI special vowel digits */
-    if (state->active && state->base_char) {
-        wchar_t special = 0;
-        switch (key) {
-        case L'6': special = L'\x0103'; break; /* ă */
-        case L'7': special = L'\x00E2'; break; /* â */
-        case L'8': special = L'\x00EA'; break; /* ê */
-        case L'9': special = L'\x00F4'; break; /* ô */
-        }
-
-        if (special) {
-            state->base_char = special;
-            state->buffer[0] = special;
-            state->compose_len = 1;
-            return TRUE;
-        }
-    }
-
-    /* Regular letter: check if it starts Vietnamese composition */
-    if (!state->active) {
-        wchar_t lower_key = (wchar_t)CharLowerW((LPWSTR)(ULONG_PTR)key);
-        for (int i = 0; vn_start_chars[i]; i++) {
-            if (vn_start_chars[i] == lower_key) {
-                state->active = TRUE;
-                state->base_char = lower_key;
-                state->buffer[0] = lower_key;
-                state->compose_len = 1;
-                return TRUE;
-            }
-        }
-    }
-
-    /* VNI: digits after non-vowel = flush + pass through */
-    if (state->active && !state->base_char) {
-        input_reset(state);
-        return FALSE;
-    }
-
-    return FALSE;
-}
-
-/* ========================================================================
- * Main Key Processing Entry Point
- *
- * Called from the keyboard hook for each key event.
- * Returns TRUE if the key was consumed (should not pass through).
- * ======================================================================== */
-
-BOOL input_process_key(EvkComposeState *state, DWORD vkey, DWORD scan,
-                       BOOL keyDown, UINT modifiers)
-{
-    EvkApp *app = &g_app;
-
-    /* Only process on key down */
-    if (!keyDown)
-        return FALSE;
-
-    /* Track timing for timeout detection (500ms gap = reset) */
-    DWORD now = GetTickCount();
-    if (state->active && (now - state->last_key_time > 500)) {
-        input_reset(state);
-    }
-    state->last_key_time = now;
-
-    /* Shift release after typing a vowel → cycle tone */
-    /* (handled in key up, skip here) */
-
-    /* Convert VK code to character */
-    BYTE keyState[256];
-    GetKeyboardState(keyState);
-    WCHAR chars[4];
-    int charCount = ToUnicode(vkey, scan, keyState, chars, 4, 0);
-
-    if (charCount != 1)
-        return FALSE;
-
-    wchar_t ch = chars[0];
-
-    /* Process based on current input method */
-    BOOL consumed = FALSE;
-    switch (app->settings.input_method) {
-    case METHOD_TELEX:
-        consumed = telex_process(state, ch);
-        break;
-    case METHOD_VNI:
-        consumed = vni_process(state, ch);
-        break;
-    case METHOD_VIQR:
-        /* VIQR processing (simplified) */
-        consumed = telex_process(state, ch); /* Fallback to Telex */
-        break;
-    default:
-        break;
-    }
-
-    return consumed;
-}
-
-/* ========================================================================
- * Backspace Handling
- *
- * When backspace is pressed during composition:
- *   - If composing a tone → remove tone
- *   - If composing a compound vowel → simplify to single vowel
- *   - If composing a single vowel → end composition, pass backspace
- * ======================================================================== */
-
-BOOL input_backspace(EvkComposeState *state)
-{
-    if (!state->active || state->compose_len == 0)
-        return FALSE;
-
-    if (state->tone_char) {
-        /* Remove tone first */
-        state->tone_char = 0;
-        return TRUE;
-    }
-
-    if (state->compose_len > 1) {
-        /* Simplify compound vowel to single vowel */
-        state->vowel_extra = 0;
-        state->compose_len = 1;
-        state->buffer[1] = 0;
-        return TRUE;
-    }
-
-    /* End composition entirely, let backspace through */
-    input_init(state);
-    return FALSE;
-}
-
-/* ========================================================================
- * Get the final composed Vietnamese character
- *
- * Combines base vowel + tone into a single precomposed Unicode character.
- * ======================================================================== */
-
-wchar_t input_get_composed_char(EvkComposeState *state)
-{
-    if (!state->active || state->compose_len == 0)
-        return 0;
-
-    wchar_t base = state->buffer[0];
-
-    /* If a tone has been applied, get the precomposed character */
-    if (state->tone_char) {
-        return state->tone_char;
-    }
-
-    /* No tone - return the base character */
-    return base;
-}
-
-/* ========================================================================
- * Output: Send Vietnamese Character
- *
- * Sends the composed character by:
- *   1. First sending backspaces to erase the compose buffer
- *   2. Then sending the final character via SendInput
- * ======================================================================== */
-
-void input_send_char(wchar_t ch)
-{
-    INPUT inputs[4];
+    INPUT inputs[2];
     memset(inputs, 0, sizeof(inputs));
 
-    /* If it's a simple ASCII character, send it directly */
-    if (ch >= 0x20 && ch <= 0x7E) {
-        inputs[0].type = INPUT_KEYBOARD;
-        inputs[0].ki.wVk = 0;
-        inputs[0].ki.wScan = ch;
-        inputs[0].ki.dwFlags = KEYEVENTF_UNICODE;
-        inputs[0].ki.time = 0;
-        SendInput(1, inputs, sizeof(INPUT));
-        return;
-    }
+    inputs[0].type = INPUT_KEYBOARD;
+    inputs[0].ki.wScan = ch;
+    inputs[0].ki.dwFlags = KEYEVENTF_UNICODE;
 
-    /* Unicode character: use clipboard paste for reliability */
-    if (OpenClipboard(NULL)) {
-        EmptyClipboard();
-        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, sizeof(wchar_t) * 2);
-        if (hMem) {
-            wchar_t *p = (wchar_t *)GlobalLock(hMem);
-            p[0] = ch;
-            p[1] = 0;
-            GlobalUnlock(hMem);
-            SetClipboardData(CF_UNICODETEXT, hMem);
-        }
-        CloseClipboard();
+    inputs[1].type = INPUT_KEYBOARD;
+    inputs[1].ki.wScan = ch;
+    inputs[1].ki.dwFlags = KEYEVENTF_UNICODE | KEYEVENTF_KEYUP;
 
-        /* Send Ctrl+V to paste */
-        memset(inputs, 0, sizeof(inputs));
-        inputs[0].type = INPUT_KEYBOARD;
-        inputs[0].ki.wVk = VK_CONTROL;
-        inputs[1].type = INPUT_KEYBOARD;
-        inputs[1].ki.wVk = 'V';
-        inputs[2].type = INPUT_KEYBOARD;
-        inputs[2].ki.wVk = 'V';
-        inputs[2].ki.dwFlags = KEYEVENTF_KEYUP;
-        inputs[3].type = INPUT_KEYBOARD;
-        inputs[3].ki.wVk = VK_CONTROL;
-        inputs[3].ki.dwFlags = KEYEVENTF_KEYUP;
-        SendInput(4, inputs, sizeof(INPUT));
-    }
+    SendInput(2, inputs, sizeof(INPUT));
 }
 
-void input_send_backspace(int count)
+static void send_backspaces(int count)
 {
     INPUT inputs[32];
     memset(inputs, 0, sizeof(inputs));
     int n = 0;
 
-    for (int i = 0; i < count && n < 30; i++) {
+    for (int i = 0; i < count && n + 1 < 32; i++) {
         inputs[n].type = INPUT_KEYBOARD;
         inputs[n].ki.wVk = VK_BACK;
         inputs[n].ki.dwFlags = 0;
@@ -446,12 +85,443 @@ void input_send_backspace(int count)
         n++;
     }
 
-    SendInput(n, inputs, sizeof(INPUT));
+    if (n > 0)
+        SendInput(n, inputs, sizeof(INPUT));
+}
+
+static void send_string(const wchar_t *str)
+{
+    for (const wchar_t *p = str; *p; p++) {
+        send_unicode_char(*p);
+    }
+}
+
+/* ========================================================================
+ * Character Classification
+ * ======================================================================== */
+
+static int is_vowel_char(wchar_t ch)
+{
+    /* Standard Vietnamese vowels */
+    if (ch == L'a' || ch == L'\x0103' || ch == L'\x00E2' ||  /* a, a-breve, a-circ */
+        ch == L'e' || ch == L'\x00EA' ||                       /* e, e-circ */
+        ch == L'i' ||                                           /* i */
+        ch == L'o' || ch == L'\x00F4' || ch == L'\x01A1' ||   /* o, o-circ, o-horn */
+        ch == L'u' || ch == L'\x01B0' ||                       /* u, u-horn */
+        ch == L'y')                                             /* y */
+        return 1;
+    return 0;
+}
+
+/**
+ * Find a character in the vowel table.
+ * Returns pointer to VowelRow or NULL.
+ */
+static const VowelRow *find_vowel_row(wchar_t ch)
+{
+    for (int i = 0; vn_vowel_table[i].base; i++) {
+        if (vn_vowel_table[i].base == ch)
+            return &vn_vowel_table[i];
+    }
+    return NULL;
+}
+
+/**
+ * Apply a tone to a base vowel, returning the precomposed character.
+ */
+static wchar_t apply_tone(wchar_t base, VnTone tone)
+{
+    const VowelRow *row = find_vowel_row(base);
+    if (!row || tone <= TONE_NONE || tone >= TONE_COUNT)
+        return 0;
+
+    switch (tone) {
+    case TONE_GRAVE: return row->grave;
+    case TONE_ACUTE: return row->acute;
+    case TONE_HOOK:  return row->hook;
+    case TONE_TILDE: return row->tilde;
+    case TONE_DOT:   return row->dot;
+    default:         return 0;
+    }
+}
+
+/* ========================================================================
+ * Telex Input Method
+ *
+ * Returns:
+ *   0 = key NOT consumed (pass through to target app)
+ *   1 = key CONSUMED (hook suppresses the keystroke)
+ *
+ * When returning 1, the caller must:
+ *   - If state->active: erase visible chars, then send the composed result
+ *   - If !state->active: the key was already handled internally
+ * ======================================================================== */
+
+static int telex_process(EvkComposeState *state, wchar_t key)
+{
+    wchar_t k = (wchar_t)(ULONG_PTR)CharLowerW((LPWSTR)(ULONG_PTR)key);
+
+    /* ---- Tone mark keys: f, s, r, x, j ---- */
+    if (state->active && is_vowel_char(state->base)) {
+        VnTone tone = TONE_NONE;
+        if (k == L'f') tone = TONE_GRAVE;
+        else if (k == L's') tone = TONE_ACUTE;
+        else if (k == L'r') tone = TONE_HOOK;
+        else if (k == L'x') tone = TONE_TILDE;
+        else if (k == L'j') tone = TONE_DOT;
+
+        if (tone != TONE_NONE) {
+            wchar_t composed = apply_tone(state->base, tone);
+            if (composed) {
+                /* Erase visible characters, send composed result */
+                send_backspaces(state->visible_count);
+                if (state->extra) {
+                    /* Compound vowel: first char passes through, tone on second */
+                    send_unicode_char(state->extra);
+                    send_unicode_char(composed);
+                } else {
+                    send_unicode_char(composed);
+                }
+                input_init(state);
+                return 1; /* Consumed */
+            }
+        }
+
+        /* z = remove tone, finalize without change */
+        if (k == L'z') {
+            send_backspaces(state->visible_count);
+            if (state->extra) {
+                send_unicode_char(state->extra);
+                send_unicode_char(state->base);
+            } else {
+                send_unicode_char(state->base);
+            }
+            input_init(state);
+            return 1;
+        }
+    }
+
+    /* ---- Double-letter special vowels: dd, aa, ee, oo ---- */
+    if (state->active && state->base == k && is_vowel_char(state->base)) {
+        wchar_t special = 0;
+
+        /* aa -> a-breve, ee -> e-circ, oo -> o-circ */
+        if (k == L'a') special = L'\x0103';
+        else if (k == L'e') special = L'\x00EA';
+        else if (k == L'o') special = L'\x00F4';
+
+        if (special) {
+            send_backspaces(state->visible_count);
+            send_unicode_char(special);
+            state->base = special;
+            state->extra = 0;
+            state->visible_count = 1;
+            return 1; /* Consumed */
+        }
+    }
+
+    /* ---- dd -> d-stroke ---- */
+    if (state->active && state->base == L'd' && k == L'd') {
+        send_backspaces(state->visible_count);
+        send_unicode_char(L'\x0111');
+        state->base = L'\x0111';
+        state->extra = 0;
+        state->visible_count = 1;
+        return 1; /* Consumed */
+    }
+
+    /* ---- w after specific vowels -> special vowels ---- */
+    if (state->active && k == L'w' && state->visible_count == 1) {
+        wchar_t special = 0;
+        if (state->base == L'o') special = L'\x01A1';  /* o-horn */
+        else if (state->base == L'u') special = L'\x01B0';  /* u-horn */
+        else if (state->base == L'a') special = L'\x0103';  /* a-breve */
+
+        if (special) {
+            send_backspaces(state->visible_count);
+            send_unicode_char(special);
+            state->base = special;
+            state->extra = 0;
+            state->visible_count = 1;
+            return 1; /* Consumed */
+        }
+    }
+
+    /* ---- Compound vowels: 2nd letter after initial vowel ---- */
+    if (state->active && state->visible_count == 1 && is_vowel_char(state->base)) {
+        if (is_vowel_char(k) && k != state->base) {
+            state->extra = k;
+            state->visible_count = 2;
+            /* Let the second char pass through visibly */
+            return 0;
+        }
+    }
+
+    /* ---- Start new composition on vowel ---- */
+    if (!state->active && is_vowel_char(k)) {
+        state->active = TRUE;
+        state->base = k;
+        state->extra = 0;
+        state->visible_count = 1;
+        /* Let the character pass through visibly */
+        return 0;
+    }
+
+    /* ---- d starts composition (might become d-stroke) ---- */
+    if (!state->active && k == L'd') {
+        state->active = TRUE;
+        state->base = L'd';
+        state->extra = 0;
+        state->visible_count = 1;
+        /* Let 'd' pass through visibly */
+        return 0;
+    }
+
+    /* ---- Non-composing key: flush if needed, let through ---- */
+    if (state->active) {
+        input_init(state);
+        return 0;
+    }
+
+    return 0;
+}
+
+/* ========================================================================
+ * VNI Input Method
+ *
+ * VNI uses digit keys for tones and special vowels:
+ *   1=huyen, 2=sac, 3=hoi, 4=nga, 5=nang, 0=remove
+ *   6=a-breve, 7=a-circ, 8=e-circ, 9=o-circ
+ *   (w after o/u -> o-horn/u-horn)
+ * ======================================================================== */
+
+static int vni_process(EvkComposeState *state, wchar_t key)
+{
+    /* ---- Tone digit keys (1-5, 0) ---- */
+    if (state->active && is_vowel_char(state->base)) {
+        VnTone tone = TONE_NONE;
+        if (key == L'1') tone = TONE_GRAVE;
+        else if (key == L'2') tone = TONE_ACUTE;
+        else if (key == L'3') tone = TONE_HOOK;
+        else if (key == L'4') tone = TONE_TILDE;
+        else if (key == L'5') tone = TONE_DOT;
+        else if (key == L'0') {
+            /* Remove tone: erase and re-send base */
+            send_backspaces(state->visible_count);
+            if (state->extra) {
+                send_unicode_char(state->extra);
+                send_unicode_char(state->base);
+            } else {
+                send_unicode_char(state->base);
+            }
+            input_init(state);
+            return 1;
+        }
+
+        if (tone != TONE_NONE) {
+            wchar_t composed = apply_tone(state->base, tone);
+            if (composed) {
+                send_backspaces(state->visible_count);
+                if (state->extra) {
+                    send_unicode_char(state->extra);
+                    send_unicode_char(composed);
+                } else {
+                    send_unicode_char(composed);
+                }
+                input_init(state);
+                return 1;
+            }
+        }
+    }
+
+    /* ---- Special vowel digit keys (6-9) ---- */
+    if (state->active && state->base) {
+        wchar_t special = 0;
+        if (key == L'6') special = L'\x0103';   /* a-breve */
+        else if (key == L'7') special = L'\x00E2';  /* a-circ */
+        else if (key == L'8') special = L'\x00EA';  /* e-circ */
+        else if (key == L'9') special = L'\x00F4';  /* o-circ */
+
+        if (special) {
+            send_backspaces(state->visible_count);
+            send_unicode_char(special);
+            state->base = special;
+            state->extra = 0;
+            state->visible_count = 1;
+            return 1;
+        }
+    }
+
+    /* ---- w after o/u -> special horn vowels ---- */
+    if (state->active && key == L'w' && state->visible_count == 1) {
+        wchar_t special = 0;
+        if (state->base == L'o') special = L'\x01A1';
+        else if (state->base == L'u') special = L'\x01B0';
+
+        if (special) {
+            send_backspaces(state->visible_count);
+            send_unicode_char(special);
+            state->base = special;
+            state->extra = 0;
+            state->visible_count = 1;
+            return 1;
+        }
+    }
+
+    /* ---- Start composition on vowel ---- */
+    if (!state->active) {
+        wchar_t k = (wchar_t)(ULONG_PTR)CharLowerW((LPWSTR)(ULONG_PTR)key);
+        if (is_vowel_char(k)) {
+            state->active = TRUE;
+            state->base = k;
+            state->extra = 0;
+            state->visible_count = 1;
+            return 0;
+        }
+    }
+
+    /* ---- Flush on non-composing key ---- */
+    if (state->active) {
+        input_init(state);
+        return 0;
+    }
+
+    return 0;
+}
+
+/* ========================================================================
+ * Main Key Processing Entry Point
+ *
+ * Called from the keyboard hook for each key-down event.
+ * Returns 1 if key was consumed (suppress the keystroke).
+ * Returns 0 if key should pass through normally.
+ *
+ * When consuming a key, the function has already sent the replacement
+ * characters via SendInput.
+ * ======================================================================== */
+
+int input_process_key(EvkComposeState *state, DWORD vkey, DWORD scan,
+                      BOOL keyDown, UINT modifiers)
+{
+    EvkApp *app = &g_app;
+
+    (void)scan;
+    (void)modifiers;
+
+    if (!keyDown)
+        return 0;
+
+    /* Timeout: if >500ms since last key, reset composition */
+    DWORD now = GetTickCount();
+    if (state->active && state->last_key_time > 0 &&
+        (now - state->last_key_time > 500)) {
+        input_init(state);
+    }
+    state->last_key_time = now;
+
+    /* Skip non-printable keys */
+    if (vkey == VK_CONTROL || vkey == VK_SHIFT || vkey == VK_MENU ||
+        vkey == VK_LCONTROL || vkey == VK_RCONTROL ||
+        vkey == VK_LSHIFT || vkey == VK_RSHIFT ||
+        vkey == VK_LMENU || vkey == VK_RMENU ||
+        vkey == VK_ESCAPE || vkey == VK_TAB ||
+        vkey == VK_DELETE || vkey == VK_INSERT ||
+        vkey == VK_HOME || vkey == VK_END ||
+        vkey == VK_PRIOR || vkey == VK_NEXT ||
+        vkey == VK_LEFT || vkey == VK_RIGHT ||
+        vkey == VK_UP || vkey == VK_DOWN ||
+        (vkey >= VK_F1 && vkey <= VK_F24) ||
+        (vkey >= VK_LWIN && vkey <= VK_APPS)) {
+        if (state->active)
+            input_init(state);
+        return 0;
+    }
+
+    /* Handle Backspace */
+    if (vkey == VK_BACK && state->active) {
+        input_init(state);
+        return 0;
+    }
+
+    /* Handle Space and Enter: finalize composition */
+    if ((vkey == VK_SPACE || vkey == VK_RETURN) && state->active) {
+        input_init(state);
+        return 0;
+    }
+
+    /* Convert VK to character */
+    BYTE keyState[256];
+    GetKeyboardState(keyState);
+    WCHAR chars[4] = {0};
+    int charCount = ToUnicode((UINT)vkey, (UINT)scan, keyState, chars, 4, 0);
+
+    if (charCount != 1)
+        return 0;
+
+    wchar_t ch = chars[0];
+
+    /* Skip non-printable chars */
+    if (ch < 0x20 || ch == 0x7F)
+        return 0;
+
+    /* ---- Process through input method ---- */
+    int consumed = 0;
+    switch (app->settings.input_method) {
+    case METHOD_TELEX:
+        consumed = telex_process(state, ch);
+        break;
+    case METHOD_VNI:
+        consumed = vni_process(state, ch);
+        break;
+    case METHOD_VIQR:
+        consumed = telex_process(state, ch);
+        break;
+    default:
+        break;
+    }
+
+    return consumed;
+}
+
+/* ========================================================================
+ * Backspace Handling
+ * ======================================================================== */
+
+int input_backspace(EvkComposeState *state)
+{
+    if (!state->active)
+        return 0;
+
+    input_init(state);
+    return 0;
+}
+
+/* ========================================================================
+ * Get the composed character (for display/status purposes)
+ * ======================================================================== */
+
+wchar_t input_get_composed_char(EvkComposeState *state)
+{
+    if (!state->active || !state->base)
+        return 0;
+    return state->base;
+}
+
+/* ========================================================================
+ * Public send functions (used by hook and other modules)
+ * ======================================================================== */
+
+void input_send_char(wchar_t ch)
+{
+    send_unicode_char(ch);
+}
+
+void input_send_backspace(int count)
+{
+    send_backspaces(count);
 }
 
 void input_send_string(const wchar_t *str)
 {
-    for (const wchar_t *p = str; *p; p++) {
-        input_send_char(*p);
-    }
+    send_string(str);
 }

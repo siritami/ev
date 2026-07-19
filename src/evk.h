@@ -198,20 +198,18 @@ typedef struct {
 
 /* ========================================================================
  * Keyboard Compose State (tracks in-progress Vietnamese character)
+ *
+ * The IME lets base characters pass through visibly. When a tone key
+ * or special vowel key is pressed, it erases the visible characters
+ * and replaces them with the composed Vietnamese character(s).
  * ======================================================================== */
 
 typedef struct {
     BOOL    active;         /* Whether we are composing */
-    wchar_t base_char;      /* The base letter typed so far */
-    wchar_t tone_char;      /* The tone mark applied */
-    wchar_t vowel_extra;      /* Additional vowel (e.g. 'a' in 'oa', 'uy' etc.) */
-    int     compose_len;    /* Number of chars in compose buffer */
-    wchar_t buffer[16];     /* Compose buffer for display */
+    wchar_t base;           /* Current base vowel character */
+    wchar_t extra;          /* Extra char for compound vowels (e.g. 'a' in 'oa') */
+    int     visible_count;  /* 1 = single vowel, 2 = compound vowel */
     DWORD   last_key_time;  /* Timestamp of last keypress */
-    DWORD   last_vkey;      /* Last virtual key code */
-    DWORD   last_scan;      /* Last scan code */
-    UINT    modifiers;      /* Current modifier state */
-    BOOL    shift_held;     /* Shift key state for tone cycling */
 } EvkComposeState;
 
 /* ========================================================================
@@ -280,19 +278,13 @@ LRESULT  hook_callback(int nCode, WPARAM wp, LPARAM lp);
 
 void     input_init(EvkComposeState *state);
 void     input_reset(EvkComposeState *state);
-BOOL     input_process_key(EvkComposeState *state, DWORD vkey, DWORD scan,
+int      input_process_key(EvkComposeState *state, DWORD vkey, DWORD scan,
                            BOOL keyDown, UINT modifiers);
-BOOL     input_backspace(EvkComposeState *state);
+int      input_backspace(EvkComposeState *state);
 wchar_t  input_get_composed_char(EvkComposeState *state);
-wchar_t  input_tone_cycle(EvkComposeState *state);
 void     input_send_char(wchar_t ch);
 void     input_send_backspace(int count);
 void     input_send_string(const wchar_t *str);
-
-/* Telex processing */
-BOOL     telex_process(EvkComposeState *state, wchar_t key);
-/* VNI processing */
-BOOL     vni_process(EvkComposeState *state, wchar_t key);
 
 /* ========================================================================
  * Function Declarations - Charset Conversion (evk_charset.c)
