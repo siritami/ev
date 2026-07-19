@@ -132,7 +132,7 @@ static BOOL CALLBACK ConfigDialogProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             /* Simple input dialog */
             if (DialogBoxParamW(NULL, MAKEINTRESOURCEW(1002), hwnd,
                 (DLGPROC)ConfigDialogProc, (LPARAM)buf)) {
-                app->settings_add_blacklist(&app->settings, buf);
+                settings_add_blacklist(&app->settings, buf);
                 HWND hList = GetDlgItem(hwnd, IDC_BLACKLIST);
                 SendMessageW(hList, LB_ADDSTRING, 0, (LPARAM)buf);
             }
