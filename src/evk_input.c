@@ -132,7 +132,7 @@ BOOL telex_process(EvkComposeState *state, wchar_t key)
         }
         /* After other vowels: w starts a compound */
         if (state->compose_len == 1) {
-            state->vowel附加 = L'w';
+            state->vowel_extra = L'w';
             state->compose_len = 2;
             state->buffer[1] = L'w';
             return TRUE;
@@ -170,7 +170,7 @@ BOOL telex_process(EvkComposeState *state, wchar_t key)
         for (int i = 0; compound_vowels[i].input; i++) {
             if (compound_vowels[i].base == state->base_char &&
                 compound_vowels[i].input[1] == lower_key) {
-                state->vowel附加 = lower_key;
+                state->vowel_extra = lower_key;
                 state->compose_len = 2;
                 state->buffer[1] = lower_key;
                 return TRUE;
@@ -343,7 +343,7 @@ BOOL input_backspace(EvkComposeState *state)
 
     if (state->compose_len > 1) {
         /* Simplify compound vowel to single vowel */
-        state->vowel附加 = 0;
+        state->vowel_extra = 0;
         state->compose_len = 1;
         state->buffer[1] = 0;
         return TRUE;

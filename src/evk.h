@@ -204,7 +204,7 @@ typedef struct {
     BOOL    active;         /* Whether we are composing */
     wchar_t base_char;      /* The base letter typed so far */
     wchar_t tone_char;      /* The tone mark applied */
-    wchar_t vowel附加;      /* Additional vowel (e.g. 'a' in 'oa', 'uy' etc.) */
+    wchar_t vowel_extra;      /* Additional vowel (e.g. 'a' in 'oa', 'uy' etc.) */
     int     compose_len;    /* Number of chars in compose buffer */
     wchar_t buffer[16];     /* Compose buffer for display */
     DWORD   last_key_time;  /* Timestamp of last keypress */
